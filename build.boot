@@ -1,9 +1,9 @@
 (task-options!
- pom {:project     'com.clojure-goes-fast/clj-async-profiler
-      :version     "0.3.0"
+ pom {:project     'clj-async-profiler-mg
+      :version     "0.3.1"
       :description "Clojure wrapper around Java's async-profiler"
       :url         "https://github.com/clojure-goes-fast/clj-async-profiler"
-      :scm         {:url "https://github.com/clojure-goes-fast/clj-async-profiler"}
+      :scm         {:url "https://github.com/markusgustavssonking/clj-async-profiler"}
       :license     {"Eclipse Public License"
                     "http://www.eclipse.org/legal/epl-v10.html"}}
  push {:repo "clojars"})
