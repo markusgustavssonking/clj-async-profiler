@@ -1,8 +1,8 @@
 (ns clj-async-profiler.core
-  (:require [clj-async-profiler.post-processing :refer [post-process-stacks]]
-            [clj-async-profiler.server :as server]
+  (:require [clj-async-profiler.post-processing :as post-proc]
             [clojure.java.io :as io]
-            [clojure.java.shell :as sh])
+            [clojure.java.shell :as sh]
+            [clojure.string :as str])
   (:import java.lang.management.ManagementFactory
            java.net.URLClassLoader
            java.text.SimpleDateFormat
@@ -19,9 +19,11 @@
 (defonce ^:private ^SimpleDateFormat date-format
   (SimpleDateFormat. "yyyy-MM-dd-HH-mm-ss"))
 
-(defn- tmp-internal-file [prefix extension]
-  (io/file temp-directory "internal"
-           (format "%s-%s.%s" prefix (.format date-format (Date.)) extension)))
+(let [cnt (atom 0)]
+  (defn- tmp-internal-file [prefix extension]
+    (io/file temp-directory "internal"
+             (format "%s-%s_%s.%s" prefix (.format date-format (Date.))
+                     (swap! cnt inc) extension))))
 
 (defn- tmp-results-file [prefix extension]
   (io/file temp-directory "results"
@@ -123,10 +125,12 @@
 
 (defn run-flamegraph-script
   "Run Flamegraph script on the provided stacks file, rendering the SVG result."
-  [in-stacks-file out-svg-file {:keys [min-width reverse? icicle?]
+  [in-stacks-file out-svg-file {:keys [min-width reverse? icicle? width height]
                                 :or {icicle? reverse?}}]
   (let [args (flatten ["perl" (flamegraph-script) "--colors=clojure"
                        (if min-width [(str "--minwidth=" min-width)] [])
+                       (if width [(str "--width=" width)] [])
+                       (if height [(str "--height=" height)] [])
                        (if reverse? ["--reverse"] [])
                        (if icicle? ["--inverted"] [])
                        (str in-stacks-file)])
@@ -135,10 +139,26 @@
       (let [f (io/file out-svg-file)]
         (io/copy (:out p) f)
         f)
-      (do (io/copy (:err p) *err*)
-          (binding [*err* *out*] (flush))))))
+      (throw (ex-info (:err p) {:cmd args})))))
 
 ;;; Profiling
+
+;; Used to assign sequential IDs to profiler runs, so that just the ID instead
+;; of the full filename can be passed to regenerate flamegraphs or diffs.
+(defonce ^:private next-run-id (atom 0))
+(defonce ^:private run-id->stacks-file (atom {}))
+(defonce ^:private flamegraph-file->metadata (atom {}))
+(defonce ^:private start-options (atom nil))
+
+(defn find-profile [run-id-or-stacks-file]
+  (if (number? run-id-or-stacks-file)
+    (@run-id->stacks-file run-id-or-stacks-file)
+    ;; When the file was passed directly, infer information from its name.
+    (let [^java.io.File f (io/file run-id-or-stacks-file)
+          [_ id event] (re-matches #"(\d+)-([^-]+)-.+" (.getName f))]
+      (when-not (.exists f)
+        (throw (ex-info (str "File " f " does not exist.") {})))
+      {:id (if id (Integer/parseInt id) -1), :stacks-file f, :event (keyword (or event :cpu))})))
 
 (defn get-self-pid
   "Returns the process ID of the current JVM process."
@@ -192,13 +212,19 @@
 (defn list-event-types
   "Print all event types that can be sampled by the profiler. Available options:
 
-  :pid - process to attach to (default: current process)"
+  :pid - process to attach to (default: current process)
+  :silent? - if true, only return the event types, don't print them."
   ([] (list-event-types {}))
   ([options]
    (let [pid (or (:pid options) (get-self-pid))
-         f (tmp-internal-file "list" "txt")]
-     (attach-agent pid (make-command-string "list" {:file f}))
-     (println (slurp f)))))
+         f (tmp-internal-file "list" "txt")
+         _ (attach-agent pid (make-command-string "list" {:file f}))
+         output (slurp f)
+         event-types (->> (str/split-lines output)
+                          (keep #(keyword (second (re-matches #"\s+(.+)" %)))))]
+     (when-not (:silent? options)
+       (println output))
+     event-types)))
 
 (defn status
   "Get profiling agent status. Available options:
@@ -226,21 +252,42 @@
          _ (attach-agent pid (make-command-string "start" (assoc options :file f)))
          msg (slurp f)]
      (if (.startsWith ^String msg "Started")
-       msg
+       (do (reset! start-options options)
+           msg)
        (throw (ex-info msg {}))))))
 
 (defn generate-flamegraph
-  "Generate a flamegraph SVG file from a collapsed stacks file, produced by
-  async-profiler. For available options, see `stop`."
-  [stacks-file options]
-  (let [flamegraph-file (tmp-results-file "flamegraph" "svg")
-        f (if-let [transform (get options :transform identity)]
-            (let [tfile (tmp-internal-file "transformed-profile" "txt")]
-              (post-process-stacks stacks-file tfile transform)
-              tfile)
-            stacks-file)]
+  "Generate a flamegraph SVG file from a collapsed stacks file, identified either
+  by its filename, or numerical ID. For available options, see `stop`."
+  [run-id-or-stacks-file options]
+  (let [{:keys [id stacks-file event]} (find-profile run-id-or-stacks-file)
+        flamegraph-file (tmp-results-file (format "%02d-%s-flamegraph" id (name event)) "svg")
+        [f samples] (if-let [transform (get options :transform identity)]
+                      (let [tfile (tmp-internal-file "transformed-profile" "txt")]
+                        [tfile (post-proc/post-process-stacks stacks-file tfile transform)])
+                      [stacks-file nil])]
     (run-flamegraph-script f flamegraph-file options)
+    (swap! flamegraph-file->metadata assoc flamegraph-file {:samples samples})
     flamegraph-file))
+
+(defn generate-diffgraph
+  "Generate a diff flamegraph SVG file from two profiles, identified by their IDs
+  or filenames. For rendering-related options, see `stop`. Extra options:
+
+  :normalize? - normalize the numbers so that the total number of stacks in two
+                runs are the same (default: true)."
+  [profile-before profile-after options]
+  (let [{id1 :id, stack1 :stacks-file, ev1 :event} (find-profile profile-before)
+        {id2 :id, stack2 :stacks-file, ev2 :event} (find-profile profile-after)
+        _ (when-not (= ev1 ev2)
+            (throw (ex-info "Profiler runs must be of the same event type."
+                            {:before ev1, :after ev2})))
+        diff-file (tmp-internal-file "diff-stacks" "txt")
+        _ (post-proc/generate-diff-file stack1 stack2 diff-file options)
+        diffgraph-file (tmp-results-file
+                        (format "%02d_%02d-%s-diff" id1 id2 (name ev1)) "svg")]
+    (run-flamegraph-script diff-file diffgraph-file options)
+    diffgraph-file))
 
 (defn stop
   "Stop the currently runnning profiler and and save the results into a temporary
@@ -252,6 +299,8 @@
   :min-width - minimum width in pixels for a frame to be shown on a flamegraph.
                Use this if the resulting flamegraph is too big and hangs your
                browser (default: nil, recommended: 1-5)
+  :width     - width of the generated flamegraph (default: 1200px, recommended to change for big screens)
+  :height    - height of the generated flamegraph
   :reverse? - if true, generate the reverse flamegraph which grows from callees
               up to callers (default: false)
   :icicle? - if true, invert the flamegraph upside down (default: false for
@@ -262,10 +311,16 @@
          ^String status-msg (status options)
          _ (when-not (.contains status-msg "is running")
              (throw (ex-info status-msg {})))
-         f (tmp-results-file "profile" "txt")]
+         run-id (swap! next-run-id inc)
+         ;; Theoretically, we can extract the profiler event from status, but
+         ;; for now it always returns "wall", so we have to rely on options.
+         event (:event @start-options :cpu)
+         ;; Capitalize event so that it's always above "flamegraph" in the list.
+         f (tmp-results-file (format "%02d-%s" run-id (name event)) "txt")]
      (attach-agent pid (make-command-string "stop" {:file f}))
+     (swap! run-id->stacks-file assoc run-id {:id run-id, :stacks-file f, :event event})
      (if (:generate-flamegraph? options true)
-       (generate-flamegraph f options)
+       (generate-flamegraph run-id options)
        f))))
 
 (defmacro profile
@@ -303,6 +358,16 @@
 (defn serve-files
   "Start a simple webserver of the results directory on the provided port."
   [port]
-  (server/start-server port (io/file temp-directory "results")))
+  (require 'clj-async-profiler.ui)
+  ((resolve 'clj-async-profiler.ui/start-server) port (io/file temp-directory "results")))
 
 #_(serve-files 8080)
+
+(defn clear-results
+  "Clear all results from /tmp/clj-async-profiler directory."
+  []
+  (doseq [f (.listFiles (io/file temp-directory "results"))]
+    (.delete ^java.io.File f))
+  (reset! next-run-id 0)
+  (reset! run-id->stacks-file {})
+  (reset! flamegraph-file->metadata {}))
